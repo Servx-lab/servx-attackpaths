@@ -1,0 +1,38 @@
+{
+  "name": "@servx/attackpaths",
+  "version": "0.1.0",
+  "description": "ServX Attack Paths — Dedicated Security Scanning & OWASP Web Top 10 Assurance Engine",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsup src/server.ts --format esm --dts",
+    "start": "node dist/server.js",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@octokit/graphql": "^9.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^9.2.4",
+    "puppeteer": "^25.3.0",
+    "zod": "^3.25.0"
+  },
+  "optionalDependencies": {
+    "cloudsploit": "^1.0.0",
+    "gitleaks": "^8.18.0",
+    "nuclei": "^3.3.0",
+    "semgrep": "^1.55.0",
+    "syft": "^1.0.0",
+    "trivy": "^0.48.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.16.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.8.0"
+  }
+}
