@@ -58,11 +58,37 @@ export async function materializeRepoFromGitHub(params: {
   const codeFiles = tree.filter((item) => {
     if (item.type !== 'blob') return false;
     const p = item.path;
-    // skip node_modules, dist, build, images, lockfiles
-    if (p.includes('node_modules/') || p.includes('dist/') || p.includes('build/') || p.includes('.git/')) return false;
-    if (p.endsWith('.png') || p.endsWith('.jpg') || p.endsWith('.lock') || p.endsWith('-lock.json')) return false;
-    // prioritize ts, js, py, go, sql, json
-    return /\.(ts|js|tsx|jsx|py|go|java|sql|json)$/i.test(p);
+    // skip node_modules, dist, build, public, static, assets, tests, docs, lockfiles, images
+    if (
+      p.includes('node_modules/') ||
+      p.includes('dist/') ||
+      p.includes('build/') ||
+      p.includes('out/') ||
+      p.includes('public/') ||
+      p.includes('static/') ||
+      p.includes('assets/') ||
+      p.includes('media/') ||
+      p.includes('vendor/') ||
+      p.includes('coverage/') ||
+      p.includes('.git/') ||
+      p.includes('.next/') ||
+      p.includes('.nuxt/') ||
+      p.includes('.output/') ||
+      p.includes('test/') ||
+      p.includes('tests/') ||
+      p.includes('__tests__/') ||
+      p.includes('spec/') ||
+      p.includes('fixtures/') ||
+      p.includes('docs/') ||
+      p.includes('doc/')
+    ) {
+      return false;
+    }
+    if (/\.(png|jpg|jpeg|gif|svg|ico|webp|mp4|mp3|woff|woff2|ttf|eot|pdf|zip|tar|gz|map|min\.js|min\.css|lock)$/i.test(p) || p.endsWith('-lock.json')) {
+      return false;
+    }
+    // prioritize ts, js, py, go, java, sql, json, yaml, yml, env, ini, conf
+    return /\.(ts|js|tsx|jsx|py|go|java|sql|json|yaml|yml|env|ini|conf)$/i.test(p);
   });
 
   // Sort: prioritize routes, controllers, middleware, services, models
