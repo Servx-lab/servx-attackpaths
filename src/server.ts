@@ -21,24 +21,21 @@ app.get('/health', (req, res) => {
 });
 
 async function startServer() {
-  try {
-    console.log(`[servx-attackpaths] Connecting to MongoDB at ${MONGODB_URI}...`);
-    await mongoose.connect(MONGODB_URI);
-    console.log(`[servx-attackpaths] Connected to MongoDB.`);
+  app.listen(PORT, () => {
+    console.log(`[servx-attackpaths] 🚀 Service running on port ${PORT}`);
+    console.log(`[servx-attackpaths] Health check available at http://localhost:${PORT}/health`);
+  });
 
+  console.log(`[servx-attackpaths] Connecting to MongoDB at ${MONGODB_URI}...`);
+  mongoose.connect(MONGODB_URI).then(() => {
+    console.log(`[servx-attackpaths] ✅ Connected to MongoDB.`);
     // Start background scanning engine loop
     runAttackPathsJobV1().catch((err) => {
       console.error(`[servx-attackpaths] Fatal error in background job runner:`, err);
     });
-
-    app.listen(PORT, () => {
-      console.log(`[servx-attackpaths] 🚀 Service running on port ${PORT}`);
-      console.log(`[servx-attackpaths] Health check available at http://localhost:${PORT}/health`);
-    });
-  } catch (err) {
-    console.error(`[servx-attackpaths] Failed to start server:`, err);
-    process.exit(1);
-  }
+  }).catch((err) => {
+    console.error(`[servx-attackpaths] ⚠️ Failed to connect to MongoDB:`, err.message || err);
+  });
 }
 
 startServer();
