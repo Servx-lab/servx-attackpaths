@@ -28,7 +28,11 @@ export interface ScannerRunResult {
 const WORKSPACE_ROOT = path.join(os.tmpdir(), 'servx-attack-paths');
 
 export async function ensureJobWorkspace(jobId: string): Promise<string> {
-  const jobDir = path.join(WORKSPACE_ROOT, jobId);
+  const safeJobId = String(jobId || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(safeJobId)) {
+    throw new Error('Invalid job id for scan workspace.');
+  }
+  const jobDir = path.join(WORKSPACE_ROOT, safeJobId);
   await fs.mkdir(jobDir, { recursive: true });
   return jobDir;
 }
