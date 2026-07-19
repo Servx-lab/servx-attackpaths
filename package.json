@@ -7,14 +7,26 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsup src/server.ts --format esm --dts",
-    "test": "tsx --test test/**/*.test.ts",
     "start": "node dist/server.js",
+    "test": "tsx --test test/**/*.test.ts",
     "lint": "eslint ."
   },
   "dependencies": {
+    "@octokit/graphql": "^9.0.3",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "mongoose": "^9.2.4",
+    "puppeteer": "^25.3.0",
     "zod": "^3.25.0"
+  },
+  "optionalDependencies": {
+    "cloudsploit": "^1.0.0",
+    "gitleaks": "^8.18.0",
+    "nuclei": "^3.3.0",
+    "semgrep": "^1.55.0",
+    "syft": "^1.0.0",
+    "trivy": "^0.48.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
