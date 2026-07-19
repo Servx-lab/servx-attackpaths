@@ -1,43 +1,32 @@
 import fs from 'fs/promises';
-import AttackPathsJobModel from '../models/AttackPathsJob.js';
 import {
-  setAttackPathsJobResult,
-  updateAttackPathsJobProgress,
-} from './jobService.js';
-import { decrypt } from '../utils/crypto.js';
-import { scanLiveDeployment } from '../scanners/dastScanner.js';
-import { fetchRepoSecurityData } from '../scanners/githubGraphScanner.js';
+  fetchRepoSecurityData,
+  type GitHubCodeScanningAlert,
+  type GitHubSecretScanningAlert,
+} from '../scanners/githubGraphScanner.js';
 import {
   transformVulnerabilityAlerts,
   type VulnerabilityItem,
 } from '../scanners/vulnerabilityTransform.js';
 import { materializeRepoFromGitHub } from './repoMaterializer.js';
 import {
-  detectScannerTools,
   ensureJobWorkspace,
   type ScannerRunResult,
 } from '../scanners/scannerRunner.js';
+import { materializeDeepRepoFromGitHub } from './deepRepoMaterializer.js';
 import {
-  runNuclei,
   runGitleaks,
   runTrivy,
   runSemgrep,
   runSyft,
-  runCloudSploit,
   parseGitleaksFindings,
   parseSemgrepFindings,
   parseTrivyFindings,
-  parseNucleiFindings,
   parseSyftFindings,
-  parseCloudSploitFindings,
 } from '../scanners/scannerWrappers.js';
 
-const OSV_API_URL = 'https://osv.dev/api/v1/query';
-
-const processAny = (globalThis as any).process as any;
-
-const JOB_POLL_MS = Number(processAny?.env?.ATTACK_PATHS_POLL_MS || 2000);
-const MAX_JOBS_PER_CYCLE = Number(processAny?.env?.ATTACK_PATHS_MAX_JOBS_PER_CYCLE || 3);
+const OSV_QUERY_BATCH_API_URL = 'https://api.osv.dev/v1/querybatch';
+const MAX_OSV_QUERIES_PER_SCAN = 500;
 
 type AttackPathFinding = {
   id: string;
@@ -47,6 +36,8 @@ type AttackPathFinding = {
   file?: string;
   source:
     | 'github_security_alert'
+    | 'github_code_scanning'
+    | 'github_secret_scanning'
     | 'live_deployment_scan'
     | 'package_scan'
     | 'secret_scan'
@@ -80,109 +71,292 @@ type OwaspAssuranceSummary = {
   categories: OwaspCategorySummary[];
 };
 
-async function claimOneQueuedJob(): Promise<any | null> {
-  const job = await AttackPathsJobModel.findOne({ status: 'queued' })
-    .sort({ createdAt: 1 })
-    .exec();
-
-  if (!job) return null;
-
-  const claimed = await AttackPathsJobModel.findOneAndUpdate(
-    { _id: job._id, status: 'queued' },
-    {
-      $set: {
-        status: 'cpgraph_building',
-        phaseMessage: 'Preparing repository scan inputs...',
-        progressPct: 5,
-        startedAt: job.startedAt || new Date(),
-      },
-    },
-    { returnDocument: 'after' as any }
-  ).exec();
-
-  return claimed as any;
-}
+type StaticAttackPathCandidate = {
+  id: string;
+  route: string;
+  routeFile: string;
+  authBoundary: 'present' | 'not_detected';
+  findingId: string;
+  findingTitle: string;
+  findingFile?: string;
+  severity: 'critical' | 'medium' | 'low';
+  confidence: 'partial';
+  note: string;
+};
 
 function safeRepoFullName(repoFullName: string) {
   return String(repoFullName || '').trim();
 }
 
-function safeTargetUrl(targetUrl: string | undefined) {
-  const value = String(targetUrl || '').trim();
-  if (!value) return '';
+type DependencyCoordinate = {
+  name: string;
+  ecosystem: 'npm' | 'PyPI' | 'Go' | 'crates.io' | 'Maven';
+  version: string;
+  file: string;
+};
 
-  try {
-    return new URL(value).toString();
-  } catch {
-    return '';
+function isExactVersion(version: string): boolean {
+  return /^(?:v)?\d+(?:\.\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?$/.test(version.trim());
+}
+
+function addDependency(
+  dependencies: Map<string, DependencyCoordinate>,
+  candidate: DependencyCoordinate
+): void {
+  const name = candidate.name.trim();
+  const version = candidate.version.trim();
+  if (!name || !isExactVersion(version)) return;
+  const key = `${candidate.ecosystem}:${name}@${version}`;
+  if (!dependencies.has(key)) dependencies.set(key, { ...candidate, name, version });
+}
+
+function npmNameFromPackageLockPath(lockPath: string): string {
+  const marker = 'node_modules/';
+  const index = lockPath.lastIndexOf(marker);
+  return index >= 0 ? lockPath.slice(index + marker.length) : '';
+}
+
+function addNpmDependencyTree(
+  dependencies: Map<string, DependencyCoordinate>,
+  entries: Record<string, any>,
+  file: string
+): void {
+  for (const [name, data] of Object.entries(entries || {})) {
+    if (!data || typeof data !== 'object') continue;
+    addDependency(dependencies, { name, version: String((data as any).version || ''), ecosystem: 'npm', file });
+    addNpmDependencyTree(dependencies, (data as any).dependencies || {}, file);
   }
 }
 
-async function fetchPackageJsonFromGitHub(
-  token: string,
-  owner: string,
-  repo: string
-): Promise<{ dependencies: Record<string, string>; devDependencies: Record<string, string> } | null> {
-  const headers = {
-    Accept: 'application/vnd.github.v3+json',
-    Authorization: `Bearer ${token}`,
-    'User-Agent': 'ServX-AttackPaths-Worker',
+function addCargoLockDependencies(dependencies: Map<string, DependencyCoordinate>, content: string, file: string): void {
+  let current: Record<string, string> = {};
+  const flush = () => {
+    addDependency(dependencies, {
+      name: current.name || '',
+      version: current.version || '',
+      ecosystem: 'crates.io',
+      file,
+    });
+    current = {};
   };
 
-  const candidates = ['package.json', 'app/package.json', 'apps/web/package.json', 'apps/api/package.json', 'frontend/package.json'];
-
-  for (const filePath of candidates) {
-    try {
-      const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`, {
-        headers,
-        cache: 'no-store',
-      });
-
-      if (!response.ok) continue;
-
-      const data = (await response.json()) as any;
-      if (!data?.content || data.encoding !== 'base64') continue;
-
-      const raw = Buffer.from(data.content, 'base64').toString('utf8');
-      const parsed = JSON.parse(raw);
-
-      return {
-        dependencies: (parsed.dependencies || {}) as Record<string, string>,
-        devDependencies: (parsed.devDependencies || {}) as Record<string, string>,
-      };
-    } catch {
+  for (const line of content.split(/\r?\n/)) {
+    if (/^\[\[package\]\]\s*$/.test(line.trim())) {
+      flush();
       continue;
+    }
+    const match = line.match(/^\s*(name|version)\s*=\s*"([^"]+)"\s*$/);
+    if (match) current[match[1]] = match[2];
+  }
+  flush();
+}
+
+function addPoetryLockDependencies(dependencies: Map<string, DependencyCoordinate>, content: string, file: string): void {
+  let current: Record<string, string> = {};
+  const flush = () => {
+    addDependency(dependencies, {
+      name: current.name || '',
+      version: current.version || '',
+      ecosystem: 'PyPI',
+      file,
+    });
+    current = {};
+  };
+
+  for (const line of content.split(/\r?\n/)) {
+    if (/^\[\[package\]\]\s*$/.test(line.trim())) {
+      flush();
+      continue;
+    }
+    const match = line.match(/^\s*(name|version)\s*=\s*"([^"]+)"\s*$/);
+    if (match) current[match[1]] = match[2];
+  }
+  flush();
+}
+
+function extractDependencyCoordinates(files: Array<{ path: string; content?: string }>): DependencyCoordinate[] {
+  const dependencies = new Map<string, DependencyCoordinate>();
+
+  for (const file of files) {
+    const content = file.content || '';
+    const baseName = file.path.split('/').pop()?.toLowerCase() || '';
+    if (!content.trim()) continue;
+
+    if (baseName === 'package-lock.json') {
+      try {
+        const lock = JSON.parse(content) as any;
+        for (const [lockPath, packageData] of Object.entries(lock.packages || {})) {
+          const name = npmNameFromPackageLockPath(lockPath);
+          addDependency(dependencies, {
+            name,
+            version: String((packageData as any)?.version || ''),
+            ecosystem: 'npm',
+            file: file.path,
+          });
+        }
+        addNpmDependencyTree(dependencies, lock.dependencies || {}, file.path);
+      } catch {
+        // A malformed lockfile is ignored here; the workflow scanner reports it separately.
+      }
+      continue;
+    }
+
+    if (baseName === 'package.json') {
+      try {
+        const manifest = JSON.parse(content) as any;
+        for (const group of [manifest.dependencies, manifest.devDependencies, manifest.optionalDependencies]) {
+          for (const [name, version] of Object.entries(group || {})) {
+            addDependency(dependencies, { name, version: String(version || ''), ecosystem: 'npm', file: file.path });
+          }
+        }
+      } catch {
+        // Ignore malformed manifests; other scanners retain the parse failure as their own signal.
+      }
+      continue;
+    }
+
+    if (baseName === 'requirements.txt') {
+      for (const line of content.split(/\r?\n/)) {
+        const match = line.match(/^\s*([A-Za-z0-9_.-]+)\s*==\s*([A-Za-z0-9_.+-]+)\s*(?:#.*)?$/);
+        if (match) addDependency(dependencies, { name: match[1], version: match[2], ecosystem: 'PyPI', file: file.path });
+      }
+      continue;
+    }
+
+    if (baseName === 'pipfile.lock') {
+      try {
+        const lock = JSON.parse(content) as any;
+        for (const group of [lock.default, lock.develop]) {
+          for (const [name, packageData] of Object.entries(group || {})) {
+            const version = String((packageData as any)?.version || '').replace(/^==/, '');
+            addDependency(dependencies, { name, version, ecosystem: 'PyPI', file: file.path });
+          }
+        }
+      } catch {
+        // Ignore malformed Pipenv locks.
+      }
+      continue;
+    }
+
+    if (baseName === 'poetry.lock') {
+      addPoetryLockDependencies(dependencies, content, file.path);
+      continue;
+    }
+
+    if (baseName === 'go.mod') {
+      let inRequireBlock = false;
+      for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (line === 'require (') {
+          inRequireBlock = true;
+          continue;
+        }
+        if (inRequireBlock && line === ')') {
+          inRequireBlock = false;
+          continue;
+        }
+        const match = (inRequireBlock ? line : line.replace(/^require\s+/, '')).match(/^([^\s]+)\s+(v?\d+(?:\.\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)/);
+        if (match && (inRequireBlock || /^require\s+/.test(line))) {
+          addDependency(dependencies, { name: match[1], version: match[2], ecosystem: 'Go', file: file.path });
+        }
+      }
+      continue;
+    }
+
+    if (baseName === 'cargo.lock') {
+      addCargoLockDependencies(dependencies, content, file.path);
+      continue;
+    }
+
+    if (baseName === 'yarn.lock') {
+      for (const stanza of content.split(/\r?\n\s*\r?\n/)) {
+        const header = stanza.match(/^\s*([^\n:]+):\s*$/m)?.[1]?.split(',')[0]?.trim().replace(/^['"]|['"]$/g, '');
+        const version = stanza.match(/^\s*version\s+["']([^"']+)["']\s*$/m)?.[1];
+        const lastAt = header?.lastIndexOf('@') ?? -1;
+        if (header && version && lastAt > 0) {
+          addDependency(dependencies, { name: header.slice(0, lastAt), version, ecosystem: 'npm', file: file.path });
+        }
+      }
+      continue;
+    }
+
+    if (baseName === 'pnpm-lock.yaml') {
+      for (const line of content.split(/\r?\n/)) {
+        const match = line.match(/^\s+['"]?((?:@[^/\s]+\/)?[^@'":\s]+)@(\d+(?:\.\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)/);
+        if (match) addDependency(dependencies, { name: match[1], version: match[2], ecosystem: 'npm', file: file.path });
+      }
+      continue;
+    }
+
+    if (baseName === 'pom.xml') {
+      const dependencyPattern = /<dependency>([\s\S]*?)<\/dependency>/g;
+      for (const match of content.matchAll(dependencyPattern)) {
+        const groupId = match[1].match(/<groupId>\s*([^<\s]+)\s*<\/groupId>/)?.[1];
+        const artifactId = match[1].match(/<artifactId>\s*([^<\s]+)\s*<\/artifactId>/)?.[1];
+        const version = match[1].match(/<version>\s*([^<\s]+)\s*<\/version>/)?.[1];
+        if (groupId && artifactId && version) {
+          addDependency(dependencies, { name: `${groupId}:${artifactId}`, version, ecosystem: 'Maven', file: file.path });
+        }
+      }
+      continue;
+    }
+
+    if (baseName === 'build.gradle' || baseName === 'build.gradle.kts') {
+      const dependencyPattern = /(?:implementation|api|compileOnly|runtimeOnly|testImplementation)\s*(?:\(|\s)\s*['"]([^:'"\s]+):([^:'"\s]+):([^'"\s)]+)['"]/g;
+      for (const match of content.matchAll(dependencyPattern)) {
+        addDependency(dependencies, {
+          name: `${match[1]}:${match[2]}`,
+          version: match[3],
+          ecosystem: 'Maven',
+          file: file.path,
+        });
+      }
     }
   }
 
-  return null;
+  return Array.from(dependencies.values()).slice(0, MAX_OSV_QUERIES_PER_SCAN);
 }
 
-async function queryOsvForPackage(name: string, ecosystem: string, version?: string): Promise<any[]> {
-  const body: Record<string, unknown> = {
-    package: { name, ecosystem },
-  };
+async function queryOsvForDependencies(
+  dependencies: DependencyCoordinate[]
+): Promise<Array<{ dependency: DependencyCoordinate; vulnerabilities: any[] }>> {
+  const results: Array<{ dependency: DependencyCoordinate; vulnerabilities: any[] }> = [];
+  const batchSize = 1000;
 
-  if (version && version !== 'latest' && version !== '*' && version !== '') {
-    body.version = version;
+  for (let start = 0; start < dependencies.length; start += batchSize) {
+    const batch = dependencies.slice(start, start + batchSize);
+    const response = await fetch(OSV_QUERY_BATCH_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        queries: batch.map((dependency) => ({
+          package: { name: dependency.name, ecosystem: dependency.ecosystem },
+          version: dependency.version,
+        })),
+      }),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) {
+      throw new Error(`OSV query batch failed (${response.status})`);
+    }
+
+    const payload = (await response.json()) as any;
+    const batchResults = Array.isArray(payload?.results) ? payload.results : [];
+    for (let index = 0; index < batch.length; index += 1) {
+      results.push({
+        dependency: batch[index],
+        vulnerabilities: Array.isArray(batchResults[index]?.vulns) ? batchResults[index].vulns : [],
+      });
+    }
   }
 
-  const response = await fetch(OSV_API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify(body),
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    return [];
-  }
-
-  const data = (await response.json()) as any;
-  return Array.isArray(data.vulns) ? data.vulns : [];
+  return results;
 }
 
-function mapOsvSeverityToFindingSeverity(severity: unknown): 'critical' | 'medium' | 'low' {
+function mapOsvSeverityToFindingSeverity(vulnerability: any): 'critical' | 'medium' | 'low' {
+  const severity = vulnerability?.database_specific?.severity || vulnerability?.ecosystem_specific?.severity || vulnerability?.severity;
   const raw = typeof severity === 'string' ? severity.toLowerCase() : '';
   if (raw.includes('critical')) return 'critical';
   if (raw.includes('high')) return 'critical';
@@ -191,55 +365,39 @@ function mapOsvSeverityToFindingSeverity(severity: unknown): 'critical' | 'mediu
 }
 
 async function scanPackageDependencies(
-  token: string,
-  owner: string,
-  repo: string,
-  repoId: string
+  repoId: string,
+  materializedFiles: Array<{ path: string; content?: string }>
 ): Promise<AttackPathFinding[]> {
-  const manifest = await fetchPackageJsonFromGitHub(token, owner, repo);
-  if (!manifest) {
-    return [];
-  }
-
-  const allDeps = {
-    ...manifest.dependencies,
-    ...manifest.devDependencies,
-  };
-
-  const entries = Object.entries(allDeps);
-  if (entries.length === 0) {
-    return [];
-  }
-
   const findings: AttackPathFinding[] = [];
   const seen = new Set<string>();
+  const dependencies = extractDependencyCoordinates(materializedFiles);
+  const osvResults = await queryOsvForDependencies(dependencies);
 
-  for (const [name, rawVersion] of entries) {
-    const version = String(rawVersion || '').replace(/^[\^~>=<]+/, '').trim();
-    if (!version) continue;
-
-    const vulns = await queryOsvForPackage(name, 'npm', version);
-    for (const vuln of vulns) {
-      const id = String(vuln.id || `${repoId}-osv-${name}-${version}`);
+  for (const { dependency, vulnerabilities } of osvResults) {
+    for (const vuln of vulnerabilities) {
+      const id = `${repoId}-osv-${dependency.ecosystem}-${dependency.name}-${dependency.version}-${String(vuln.id || 'unknown')}`;
       if (seen.has(id)) continue;
       seen.add(id);
 
-      const summary = String(vuln.summary || vuln.details || `Known vulnerability in ${name}`).trim();
-      const severity = mapOsvSeverityToFindingSeverity((vuln.severity || [])[0]);
+      const summary = String(vuln.summary || vuln.details || `Known vulnerability in ${dependency.name}`).trim();
+      const severity = mapOsvSeverityToFindingSeverity(vuln);
 
       findings.push({
         id,
         severity,
-        title: `Dependency vulnerability: ${name}@${version}`,
+        title: `Dependency vulnerability: ${dependency.name}@${dependency.version}`,
         detail: summary,
-        file: 'package.json',
+        file: dependency.file,
         source: 'package_scan',
         metadata: {
-          packageName: name,
-          version,
+          packageName: dependency.name,
+          ecosystem: dependency.ecosystem,
+          version: dependency.version,
           osvId: vuln.id,
           aliases: vuln.aliases || [],
           published: vuln.published || null,
+          references: vuln.references || [],
+          provenance: 'OSV query batch',
         },
       });
     }
@@ -414,6 +572,59 @@ async function scanForSastPatterns(
   }
 
   return findings;
+}
+
+/**
+ * Builds only evidence-backed, source-local path candidates. A route and a
+ * dangerous sink must occur in the same source file; the result remains
+ * `partial` until later control-flow and deployment verification exist.
+ */
+export function buildStaticAttackPathCandidates(
+  files: Array<{ path: string; content?: string }>,
+  findings: AttackPathFinding[]
+): StaticAttackPathCandidate[] {
+  const candidates: StaticAttackPathCandidate[] = [];
+  const seen = new Set<string>();
+  const sinkFindings = findings.filter((finding) => finding.source === 'sast_scan');
+
+  for (const file of files) {
+    const content = file.content || '';
+    if (!content) continue;
+    const routes = new Set<string>();
+    for (const match of content.matchAll(/\b(?:app|router)\.(?:get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`]+)['"`]/g)) {
+      routes.add(match[1]);
+    }
+    const nextRoute = file.path.match(/(?:^|\/)app\/api\/(.+)\/route\.(?:[cm]?[jt]sx?)$/i);
+    if (nextRoute) routes.add(`/api/${nextRoute[1].replace(/\/\[\.\.\.([^\]]+)\]/g, ':$1*').replace(/\/\[([^\]]+)\]/g, ':$1')}`);
+    if (routes.size === 0) continue;
+
+    const authBoundary: StaticAttackPathCandidate['authBoundary'] =
+      /\b(?:requireAuth|authenticate|authMiddleware|withAuth|isAuthenticated|authorize|permission)\b/i.test(content)
+        ? 'present'
+        : 'not_detected';
+    const fileFindings = sinkFindings.filter((finding) => String(finding.file || '').replace(/:\d+(?::\d+)?$/, '') === file.path);
+    for (const route of routes) {
+      for (const finding of fileFindings) {
+        const id = `candidate-${route}-${finding.id}`.replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 140);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        candidates.push({
+          id,
+          route,
+          routeFile: file.path,
+          authBoundary,
+          findingId: finding.id,
+          findingTitle: finding.title,
+          findingFile: finding.file,
+          severity: finding.severity,
+          confidence: 'partial',
+          note: 'Source-local route-to-sink candidate. Control flow, reachability, and deployment exposure are not verified.',
+        });
+      }
+    }
+  }
+
+  return candidates.slice(0, 100);
 }
 
 async function scanForIacIssues(
@@ -688,8 +899,62 @@ function makeGitHubFindings(repoId: string, alerts: VulnerabilityItem[]): Attack
       severity: alert.severity,
       cvssScore: alert.cvssScore,
       createdAt: alert.createdAt,
+      provenance: 'GitHub Dependabot alert',
     },
   }));
+}
+
+function mapGitHubCodeSeverity(value: string | undefined): 'critical' | 'medium' | 'low' {
+  const severity = String(value || '').toLowerCase();
+  if (severity === 'critical' || severity === 'high' || severity === 'error') return 'critical';
+  if (severity === 'medium' || severity === 'moderate' || severity === 'warning') return 'medium';
+  return 'low';
+}
+
+function makeGitHubCodeScanningFindings(repoId: string, alerts: GitHubCodeScanningAlert[]): AttackPathFinding[] {
+  return alerts.map((alert) => ({
+    id: `${repoId}-gh-code-${alert.number}`,
+    severity: mapGitHubCodeSeverity(alert.severity),
+    title: `GitHub code scanning: ${alert.ruleId}`,
+    detail: alert.description || 'Open GitHub code-scanning alert detected for this repository.',
+    file: alert.path ? `${alert.path}${alert.startLine ? `:${alert.startLine}` : ''}` : 'repository source',
+    source: 'github_code_scanning',
+    metadata: {
+      alertNumber: alert.number,
+      ruleId: alert.ruleId,
+      tags: alert.tags,
+      toolName: alert.toolName || null,
+      htmlUrl: alert.htmlUrl || null,
+      createdAt: alert.createdAt || null,
+      provenance: 'GitHub code scanning alert',
+    },
+  }));
+}
+
+function makeGitHubSecretScanningFindings(repoId: string, alerts: GitHubSecretScanningAlert[]): AttackPathFinding[] {
+  return alerts.map((alert) => {
+    const activeOrPublic = alert.validity === 'active' || alert.publiclyLeaked;
+    const secretType = alert.secretTypeDisplayName || alert.secretType;
+    return {
+      id: `${repoId}-gh-secret-${alert.number}`,
+      severity: activeOrPublic ? 'critical' : 'medium',
+      title: `GitHub secret scanning: ${secretType}`,
+      detail: activeOrPublic
+        ? 'GitHub reports an active or publicly leaked secret. Revoke and rotate it immediately; the secret value is intentionally not displayed by ServX.'
+        : 'GitHub reports a potential secret. Confirm exposure, then revoke and rotate it if valid; the secret value is intentionally not displayed by ServX.',
+      file: 'GitHub secret scanning alert',
+      source: 'github_secret_scanning',
+      metadata: {
+        alertNumber: alert.number,
+        secretType: alert.secretType,
+        validity: alert.validity || null,
+        publiclyLeaked: Boolean(alert.publiclyLeaked),
+        htmlUrl: alert.htmlUrl || null,
+        createdAt: alert.createdAt || null,
+        provenance: 'GitHub secret scanning alert',
+      },
+    };
+  });
 }
 
 function makeLiveFindings(repoId: string, targetUrl: string, findings: Array<{ type: string; pattern: string; context: string; source: string }>): AttackPathFinding[] {
@@ -715,7 +980,7 @@ function categoriesForFinding(finding: AttackPathFinding): string[] {
   if (source === 'github_security_alert' || source === 'package_scan' || source === 'sbom_scan') {
     return ['A08'];
   }
-  if (source === 'secret_scan' || title.includes('token') || title.includes('key')) {
+  if (source === 'github_secret_scanning' || source === 'secret_scan' || title.includes('token') || title.includes('key')) {
     return ['A04', 'A02'];
   }
   if (source === 'iac_scan' || source === 'cspm_scan') {
@@ -726,7 +991,7 @@ function categoriesForFinding(finding: AttackPathFinding): string[] {
     if (title.includes('cookie') || title.includes('hsts') || title.includes('header')) return ['A02'];
     return ['A05', 'A02'];
   }
-  if (source === 'sast_scan') {
+  if (source === 'github_code_scanning' || source === 'sast_scan') {
     if (title.includes('injection')) return ['A05'];
     if (title.includes('eval') || title.includes('function constructor')) return ['A06'];
     if (title.includes('xss')) return ['A03'];
@@ -767,9 +1032,9 @@ function buildOwaspWebAssuranceSummary(findings: AttackPathFinding[], toolStatus
       const hasRelevantTool =
         (category.id === 'A01' && findings.some((f) => f.source === 'dast_scan' || f.source === 'live_deployment_scan')) ||
         (category.id === 'A02' && findings.some((f) => f.source === 'iac_scan' || f.source === 'cspm_scan' || f.source === 'dast_scan')) ||
-        (category.id === 'A03' && findings.some((f) => f.source === 'sast_scan')) ||
-        (category.id === 'A04' && findings.some((f) => f.source === 'secret_scan')) ||
-        (category.id === 'A05' && findings.some((f) => f.source === 'sast_scan' || f.source === 'dast_scan')) ||
+        (category.id === 'A03' && findings.some((f) => f.source === 'sast_scan' || f.source === 'github_code_scanning')) ||
+        (category.id === 'A04' && findings.some((f) => f.source === 'secret_scan' || f.source === 'github_secret_scanning')) ||
+        (category.id === 'A05' && findings.some((f) => f.source === 'sast_scan' || f.source === 'github_code_scanning' || f.source === 'dast_scan')) ||
         (category.id === 'A08' && findings.some((f) => f.source === 'package_scan' || f.source === 'github_security_alert' || f.source === 'sbom_scan'));
 
       status = hasRelevantTool ? 'partial' : 'not_assessed';
@@ -829,6 +1094,7 @@ function buildGraphArtifact(params: {
   failedScanners: Array<{ scanner: string; error: string }>;
   toolStatuses: ScannerRunResult[];
   assuranceSummary: OwaspAssuranceSummary;
+  attackPathCandidates: StaticAttackPathCandidate[];
 }) {
   const {
     repoFullName,
@@ -845,6 +1111,7 @@ function buildGraphArtifact(params: {
     failedScanners,
     toolStatuses,
     assuranceSummary,
+    attackPathCandidates,
   } = params;
 
   const nodes: any[] = [
@@ -888,12 +1155,36 @@ function buildGraphArtifact(params: {
     edges.push({ from: 'repo', to: 'cspm', type: 'analyzes' });
   }
 
+  for (const candidate of attackPathCandidates) {
+    const routeNodeId = `route-${candidate.id}`;
+    const sinkNodeId = `sink-${candidate.findingId}`;
+    nodes.push({
+      id: routeNodeId,
+      type: 'route',
+      label: candidate.route,
+      metadata: { file: candidate.routeFile, authBoundary: candidate.authBoundary, confidence: candidate.confidence },
+    });
+    nodes.push({
+      id: sinkNodeId,
+      type: 'finding',
+      label: candidate.findingTitle,
+      metadata: { findingId: candidate.findingId, file: candidate.findingFile, severity: candidate.severity },
+    });
+    edges.push({ from: 'repo', to: routeNodeId, type: 'contains_route' });
+    edges.push({ from: routeNodeId, to: sinkNodeId, type: 'potential_reachable_sink', confidence: 'partial' });
+  }
+
   return {
     version: 'v5-owasp-web-assurance',
     summary: {
       repoFullName,
       targetUrl: targetUrl || null,
       githubFindings: githubFindings.length,
+      githubSecuritySources: {
+        dependabot: githubFindings.filter((finding) => finding.source === 'github_security_alert').length,
+        codeScanning: githubFindings.filter((finding) => finding.source === 'github_code_scanning').length,
+        secretScanning: githubFindings.filter((finding) => finding.source === 'github_secret_scanning').length,
+      },
       packageScanFindings: packageScanFindings.length,
       secretFindings: secretFindings.length,
       sastFindings: sastFindings.length,
@@ -919,80 +1210,112 @@ function buildGraphArtifact(params: {
         findingsCount: tool.findingsCount,
         error: tool.error || null,
         artifacts: tool.artifacts.map((artifact) => ({
-          path: artifact.path,
           kind: artifact.kind,
           sizeBytes: artifact.sizeBytes,
         })),
       })),
       failedScanners,
+      attackPathCandidatesCount: attackPathCandidates.length,
     },
     nodes,
     edges,
+    attackPathCandidates,
   };
 }
 
-async function resolveGitHubSecurityToken(job: any, fallbackAccessToken: string | null): Promise<string> {
-  if (job.githubAccessTokenEnc && job.githubTokenIv) {
-    try {
-      const token = decrypt({ content: job.githubAccessTokenEnc, iv: job.githubTokenIv });
-      console.log(`[attackPathsJobRunner] Decrypted OAuth token from job document`);
-      return token;
-    } catch (err: any) {
-      console.warn(`[attackPathsJobRunner] Failed to decrypt token: ${err?.message}`);
-    }
+export type RemoteAttackPathsJobInput = {
+  jobId: string;
+  repoId: string;
+  repoFullName: string;
+  targetUrl?: string;
+  scanTypes: string[];
+  analysisDepth: number;
+  profile: 'quick' | 'deep_repo' | 'verified_live';
+  executionLeaseId: string;
+  leaseExpiresAt: string;
+  githubAccessToken: string;
+};
+
+export type AttackPathsJobReporter = {
+  progress: (update: { status: string; progressPct: number; phaseMessage: string }) => Promise<void>;
+  complete: (update: Record<string, any>) => Promise<void>;
+  fail: (update: { lastError: string; progressPct?: number }) => Promise<void>;
+};
+
+class ScanCancelledError extends Error {
+  constructor() {
+    super('Scan cancelled.');
+    this.name = 'ScanCancelledError';
   }
-  if (fallbackAccessToken) {
-    console.log(`[attackPathsJobRunner] Using fallback access token`);
-    return fallbackAccessToken;
-  }
-  if (process.env.GITHUB_TOKEN) {
-    console.log(`[attackPathsJobRunner] Using environment GITHUB_TOKEN`);
-    return process.env.GITHUB_TOKEN;
-  }
-  throw new Error('No GitHub security token available for repository scan');
 }
 
-async function processJob(job: any) {
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ScanCancelledError();
+}
+
+async function processJob(job: any, reporter: AttackPathsJobReporter, signal?: AbortSignal): Promise<void> {
   const jobId = String(job._id);
   const repoId = String(job.repoId || jobId);
   const repoFullName = safeRepoFullName(job.repoFullName);
-  const targetUrl = safeTargetUrl(job.targetUrl);
-  let githubAccessToken: string | null = null;
+  const requestedTargetUrl = String(job.targetUrl || '').trim();
+  const targetUrl = '';
+  const isQuickProfile = job.profile === 'quick';
+  const isDeepRepositoryProfile = job.profile === 'deep_repo';
+  let jobDir = '';
+  const githubAccessToken =
+    typeof job.githubAccessToken === 'string' && job.githubAccessToken.trim()
+      ? job.githubAccessToken.trim()
+      : '';
+
+  const reportProgress = async (update: { status: string; progressPct: number; phaseMessage: string }) => {
+    await reporter.progress(update);
+  };
+
+  const reportCompletion = async (update: Record<string, any>) => {
+    await reporter.complete(update);
+  };
 
   try {
-    if (job.githubAccessTokenEnc && job.githubTokenIv) {
-      githubAccessToken = decrypt({
-        iv: String(job.githubTokenIv),
-        content: String(job.githubAccessTokenEnc),
-      });
-    }
-
+    throwIfCancelled(signal);
     if (!repoFullName.includes('/')) {
       throw new Error(`Invalid repoFullName for job: ${repoFullName}`);
+    }
+    if (!githubAccessToken) {
+      throw new Error('ServX did not supply a GitHub token for this repository scan.');
+    }
+    if (job.profile === 'verified_live') {
+      throw new Error('Live deployment scanning is not enabled yet. It requires ownership verification and outbound-network isolation before release.');
+    }
+    if (!isQuickProfile && !isDeepRepositoryProfile) {
+      throw new Error('Unsupported scan profile.');
+    }
+    if (requestedTargetUrl) {
+      throw new Error('Live deployment scanning is not enabled yet. It requires ownership verification and outbound-network isolation before release.');
     }
 
     const [owner, repo] = repoFullName.split('/');
     const failedScanners: Array<{ scanner: string; error: string }> = [];
     const toolStatuses: ScannerRunResult[] = [];
 
-    const jobDir = await ensureJobWorkspace(jobId);
+    jobDir = await ensureJobWorkspace(jobId);
     let repoScanDir = jobDir;
 
-    await updateAttackPathsJobProgress(jobId, {
+    await reportProgress({
       status: 'cpgraph_building',
       progressPct: 5,
       phaseMessage: 'Preparing repository scan inputs...',
-    } as any);
+    });
 
     let materializedFiles: Array<{ path: string; content?: string }> = [];
     try {
+      throwIfCancelled(signal);
       const materializedRepo = await materializeRepoFromGitHub({
         jobId,
         repoFullName,
-        accessToken: githubAccessToken || '',
-        maxFilesToFetch: 60,
+        accessToken: githubAccessToken,
+        maxFilesToFetch: 200,
+        signal,
       });
-      repoScanDir = materializedRepo.workDir;
       materializedFiles = materializedRepo.files.map((file) => ({
         path: file.path,
         content: file.content,
@@ -1006,35 +1329,59 @@ async function processJob(job: any) {
       console.warn(`[attackPathsJobRunner] Materialization failed for ${repoFullName}: ${err?.message || String(err)}`);
     }
 
-    await updateAttackPathsJobProgress(jobId, {
-      status: 'cpgraph_analyzing',
-      progressPct: 12,
-      phaseMessage: 'Detecting available scanner tools...',
-    } as any);
+    if (isDeepRepositoryProfile) {
+      await reportProgress({
+        status: 'cpgraph_building',
+        progressPct: 10,
+        phaseMessage: 'Preparing the authorized repository for deep scanning...',
+      });
+      try {
+        throwIfCancelled(signal);
+        const deepRepo = await materializeDeepRepoFromGitHub({
+          jobDir,
+          repoFullName,
+          accessToken: githubAccessToken,
+          signal,
+        });
+        repoScanDir = deepRepo.workDir;
+        console.log(`[attackPathsJobRunner] Deep repository materialized at ${deepRepo.revision} (${deepRepo.sizeBytes} bytes).`);
+      } catch (err: any) {
+        failedScanners.push({
+          scanner: 'deep_repo_materializer',
+          error: err?.message || 'Failed to prepare repository for deep scanning',
+        });
+        console.warn(`[attackPathsJobRunner] Deep materialization failed for ${repoFullName}: ${err?.message || String(err)}`);
+      }
+    }
 
-    const requestedTools = ['nuclei', 'gitleaks', 'trivy', 'semgrep', 'syft', 'cloudsploit'];
-    const availableTools = await detectScannerTools(requestedTools);
-    const installedTools = availableTools.filter((tool) => tool.installed).map((tool) => tool.name);
-    console.log(`[attackPathsJobRunner] Available scanners: ${installedTools.join(', ') || 'none'}`);
-
-    await updateAttackPathsJobProgress(jobId, {
+    await reportProgress({
       status: 'cpgraph_analyzing',
       progressPct: 18,
-      phaseMessage: `Running scanners: ${installedTools.length}/${requestedTools.length} tools available`,
-    } as any);
+      phaseMessage: isQuickProfile
+        ? 'Collecting GitHub alerts and bounded dependency evidence...'
+        : 'Running queued deep repository scanners...',
+    });
 
     const githubPromise = (async (): Promise<AttackPathFinding[]> => {
-      const githubToken = await resolveGitHubSecurityToken(job, githubAccessToken);
       console.log(`[attackPathsJobRunner] Fetching GitHub security alerts for ${repoFullName}...`);
-      const raw = await fetchRepoSecurityData(owner, repo, githubToken);
+      const raw = await fetchRepoSecurityData(owner, repo, githubAccessToken);
       const transformed = transformVulnerabilityAlerts(raw.nodes);
-      return makeGitHubFindings(repoId, transformed.alerts);
+      for (const sourceFailure of raw.sourceErrors) {
+        failedScanners.push({
+          scanner: `github_${sourceFailure.source}`,
+          error: sourceFailure.message,
+        });
+      }
+      return [
+        ...makeGitHubFindings(repoId, transformed.alerts),
+        ...makeGitHubCodeScanningFindings(repoId, raw.codeScanningAlerts),
+        ...makeGitHubSecretScanningFindings(repoId, raw.secretScanningAlerts),
+      ];
     })();
 
     const packagePromise = (async (): Promise<AttackPathFinding[]> => {
-      const packageToken = githubAccessToken || (await resolveGitHubSecurityToken(job, githubAccessToken));
       console.log(`[attackPathsJobRunner] Scanning package dependencies via OSV for ${repoFullName}...`);
-      return scanPackageDependencies(packageToken, owner, repo, repoId);
+      return scanPackageDependencies(repoId, materializedFiles);
     })();
 
     const builtinSecretPromise = scanForSecrets(repoId, materializedFiles);
@@ -1042,44 +1389,61 @@ async function processJob(job: any) {
     const builtinIacPromise = scanForIacIssues(repoId, materializedFiles);
     const builtinSbomPromise = extractSbomManifest(repoId, materializedFiles);
     const builtinCspmPromise = scanForCspmConfigs(repoId, materializedFiles);
-    const builtinDastPromise = targetUrl ? scanForDastSignals(repoId, targetUrl) : Promise.resolve([]);
+    const builtinDastPromise = Promise.resolve([] as AttackPathFinding[]);
 
-    let gitleaksResult: ScannerRunResult = { tool: 'gitleaks', status: 'skipped', findingsCount: 0, artifacts: [], error: 'gitleaks is not installed on this worker.' };
-    let semgrepResult: ScannerRunResult = { tool: 'semgrep', status: 'skipped', findingsCount: 0, artifacts: [], error: 'semgrep is not installed on this worker.' };
-    let trivyResult: ScannerRunResult = { tool: 'trivy', status: 'skipped', findingsCount: 0, artifacts: [], error: 'trivy is not installed on this worker.' };
-    let nucleiResult: ScannerRunResult = { tool: 'nuclei', status: 'skipped', findingsCount: 0, artifacts: [], error: 'nuclei is not installed on this worker.' };
-    let syftResult: ScannerRunResult = { tool: 'syft', status: 'skipped', findingsCount: 0, artifacts: [], error: 'syft is not installed on this worker.' };
-    let cloudsploitResult: ScannerRunResult = { tool: 'cloudsploit', status: 'skipped', findingsCount: 0, artifacts: [], error: 'cloudsploit is not installed on this worker.' };
+    let gitleaksResult: ScannerRunResult = { tool: 'gitleaks', status: 'skipped', findingsCount: 0, artifacts: [], error: 'Deep profile was not requested.' };
+    let semgrepResult: ScannerRunResult = { tool: 'semgrep', status: 'skipped', findingsCount: 0, artifacts: [], error: 'Deep profile was not requested.' };
+    let trivyResult: ScannerRunResult = { tool: 'trivy', status: 'skipped', findingsCount: 0, artifacts: [], error: 'Deep profile was not requested.' };
+    let syftResult: ScannerRunResult = { tool: 'syft', status: 'skipped', findingsCount: 0, artifacts: [], error: 'Deep profile was not requested.' };
 
-    if (installedTools.includes('gitleaks')) {
-      gitleaksResult = await runGitleaks({ repoDir: repoScanDir, jobDir });
+    if (isDeepRepositoryProfile) {
+      if (repoScanDir === jobDir) {
+        const error = 'Deep repository workspace is unavailable.';
+        gitleaksResult.error = error;
+        semgrepResult.error = error;
+        trivyResult.error = error;
+        syftResult.error = error;
+      } else {
+        throwIfCancelled(signal);
+        await reportProgress({
+          status: 'cpgraph_analyzing',
+          progressPct: 25,
+          phaseMessage: 'Scanning repository history and source files for exposed secrets...',
+        });
+        gitleaksResult = await runGitleaks({ repoDir: repoScanDir, jobDir, signal });
+        throwIfCancelled(signal);
+        await reportProgress({
+          status: 'cpgraph_analyzing',
+          progressPct: 40,
+          phaseMessage: 'Analyzing source code with Semgrep security rules...',
+        });
+        semgrepResult = await runSemgrep({ repoDir: repoScanDir, jobDir, signal });
+        throwIfCancelled(signal);
+        await reportProgress({
+          status: 'cpgraph_analyzing',
+          progressPct: 55,
+          phaseMessage: 'Checking dependencies, secrets, and infrastructure configuration...',
+        });
+        trivyResult = await runTrivy({ target: repoScanDir, jobDir, signal });
+        throwIfCancelled(signal);
+        await reportProgress({
+          status: 'sandbox_verifying',
+          progressPct: 65,
+          phaseMessage: 'Building the repository software inventory...',
+        });
+        syftResult = await runSyft({ target: repoScanDir, jobDir, signal });
+        throwIfCancelled(signal);
+      }
+      toolStatuses.push(gitleaksResult, semgrepResult, trivyResult, syftResult);
+      for (const tool of toolStatuses) {
+        if (tool.status === 'failed') {
+          failedScanners.push({
+            scanner: tool.tool,
+            error: tool.error || 'Scanner failed without an error message.',
+          });
+        }
+      }
     }
-    toolStatuses.push(gitleaksResult);
-
-    if (installedTools.includes('semgrep')) {
-      semgrepResult = await runSemgrep({ repoDir: repoScanDir, jobDir });
-    }
-    toolStatuses.push(semgrepResult);
-
-    if (installedTools.includes('trivy')) {
-      trivyResult = await runTrivy({ target: repoScanDir, jobDir });
-    }
-    toolStatuses.push(trivyResult);
-
-    if (installedTools.includes('nuclei') && targetUrl) {
-      nucleiResult = await runNuclei({ targetUrl, jobDir });
-    }
-    toolStatuses.push(nucleiResult);
-
-    if (installedTools.includes('syft')) {
-      syftResult = await runSyft({ target: repoScanDir, jobDir });
-    }
-    toolStatuses.push(syftResult);
-
-    if (installedTools.includes('cloudsploit')) {
-      cloudsploitResult = await runCloudSploit({ jobDir });
-    }
-    toolStatuses.push(cloudsploitResult);
 
     const [
       githubFindings,
@@ -1093,9 +1457,7 @@ async function processJob(job: any) {
       gitleaksFindings,
       semgrepFindings,
       trivyFindings,
-      nucleiFindings,
       syftFindings,
-      cloudsploitFindings,
     ] = await Promise.all([
       githubPromise.catch((err: any) => {
         console.error(`[attackPathsJobRunner] GitHub security alerts fetch failed for ${repoFullName}: ${err?.message || String(err)}`);
@@ -1140,45 +1502,30 @@ async function processJob(job: any) {
       parseGitleaksFindings(repoId, gitleaksResult),
       parseSemgrepFindings(repoId, semgrepResult),
       parseTrivyFindings(repoId, trivyResult),
-      parseNucleiFindings(repoId, nucleiResult),
       parseSyftFindings(repoId, syftResult),
-      parseCloudSploitFindings(repoId, cloudsploitResult),
     ]);
 
-    await updateAttackPathsJobProgress(jobId, {
+    await reportProgress({
       status: 'sandbox_verifying',
       progressPct: 70,
-      phaseMessage: targetUrl
-        ? 'Scanning live deployment for exposed secrets...'
-        : 'No live deployment URL provided. Finalizing repository findings...',
-    } as any);
+      phaseMessage: 'Finalizing bounded repository findings...',
+    });
 
-    let liveFindings: AttackPathFinding[] = [];
-    if (targetUrl) {
-      try {
-        const leaked = await scanLiveDeployment(targetUrl);
-        liveFindings = makeLiveFindings(repoId, targetUrl, leaked);
-      } catch (err: any) {
-        failedScanners.push({
-          scanner: 'live_deployment_scan',
-          error: err?.message || 'Failed to scan live deployment',
-        });
-      }
-    }
+    const liveFindings: AttackPathFinding[] = [];
 
-    await updateAttackPathsJobProgress(jobId, {
+    await reportProgress({
       status: 'rendering_report',
       progressPct: 90,
       phaseMessage: 'Normalizing real findings for dashboard rendering...',
-    } as any);
+    });
 
     const secretFindings = [...builtinSecretFindings, ...gitleaksFindings];
     const sastFindings = [...builtinSastFindings, ...semgrepFindings];
-    const iacFindings = [...builtinIacFindings, ...trivyFindings.filter((f) => f.source === 'iac_scan')];
-    const packageScanFindingsMerged = [...packageScanFindings, ...trivyFindings.filter((f) => f.source === 'package_scan')];
+    const iacFindings = [...builtinIacFindings, ...trivyFindings.filter((finding) => finding.source === 'iac_scan')];
+    const packageScanFindingsMerged = [...packageScanFindings, ...trivyFindings.filter((finding) => finding.source === 'package_scan')];
     const sbomFindings = [...builtinSbomFindings, ...syftFindings];
-    const cspmFindings = [...builtinCspmFindings, ...cloudsploitFindings];
-    const dastFindings = [...builtinDastFindings, ...nucleiFindings];
+    const cspmFindings = [...builtinCspmFindings];
+    const dastFindings = [...builtinDastFindings];
 
     const repoFindings = [
       ...githubFindings,
@@ -1191,6 +1538,7 @@ async function processJob(job: any) {
 
     const summaryFindings = [...sbomFindings, ...cspmFindings];
     const results = [...repoFindings, ...liveFindings, ...summaryFindings];
+    const attackPathCandidates = buildStaticAttackPathCandidates(materializedFiles, results);
     const scanArtifacts = toolStatuses.flatMap((tool) => tool.artifacts);
     const assuranceSummary = buildOwaspWebAssuranceSummary(results, toolStatuses);
 
@@ -1204,13 +1552,13 @@ async function processJob(job: any) {
       console.warn(`[attackPathsJobRunner] No findings for ${jobId}. Repo may have no detectable issues or GitHub token lacks permissions.`);
     }
 
-    await setAttackPathsJobResult(jobId, {
+    await reportCompletion({
       status: 'completed',
       progressPct: 100,
       phaseMessage:
         failedScanners.length > 0
-          ? 'Real security scan completed with partial coverage'
-          : 'Real security scan completed',
+          ? 'Repository evidence collection completed with partial coverage'
+          : 'Repository evidence collection completed',
       results,
       scanArtifacts,
       toolStatuses: toolStatuses.map((tool) => ({
@@ -1241,6 +1589,7 @@ async function processJob(job: any) {
         failedScanners,
         toolStatuses,
         assuranceSummary,
+        attackPathCandidates,
       }),
       reportArtifactUrl: '',
       lastError: failedScanners.length > 0 ? failedScanners.map((item) => `${item.scanner}: ${item.error}`).join('; ') : '',
@@ -1250,36 +1599,40 @@ async function processJob(job: any) {
   } catch (err: any) {
     const lastError = err?.message || String(err);
 
-    await AttackPathsJobModel.findByIdAndUpdate(jobId, {
-      $set: {
-        status: 'failed',
-        progressPct: job.progressPct || 0,
-        phaseMessage: 'Job failed',
-        lastError,
-        completedAt: new Date(),
-      },
-    }).exec();
+    if (err instanceof ScanCancelledError || signal?.aborted) {
+      console.log(`[attackPathsJobRunner] job cancelled: ${jobId}`);
+      return;
+    }
+
+    await reporter.fail({ lastError, progressPct: job.progressPct || 0 });
 
     console.error(`[attackPathsJobRunner] job failed: ${jobId}`, err);
+  } finally {
+    if (jobDir) {
+      await fs.rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
-export async function runAttackPathsJobV1(): Promise<void> {
-  console.log('[attackPathsJobRunner] starting polling loop');
-
-  while (true) {
-    try {
-      for (let i = 0; i < MAX_JOBS_PER_CYCLE; i++) {
-        const job = await claimOneQueuedJob();
-        if (!job) break;
-
-        console.log(`[attackPathsJobRunner] claimed job: ${String(job._id)}`);
-        await processJob(job);
-      }
-    } catch (err) {
-      console.error('[attackPathsJobRunner] cycle error', err);
-    }
-
-    await new Promise((r) => setTimeout(r, JOB_POLL_MS));
-  }
+/** Runs a ServX-dispatched job without connecting the executor to ServX MongoDB. */
+export async function runRemoteAttackPathsJob(
+  input: RemoteAttackPathsJobInput,
+  reporter: AttackPathsJobReporter,
+  signal?: AbortSignal
+): Promise<void> {
+  await processJob(
+    {
+      _id: input.jobId,
+      repoId: input.repoId,
+      repoFullName: input.repoFullName,
+      targetUrl: input.targetUrl || '',
+      profile: input.profile,
+      scanTypes: input.scanTypes,
+      analysisDepth: input.analysisDepth,
+      githubAccessToken: input.githubAccessToken,
+      progressPct: 0,
+    },
+    reporter,
+    signal
+  );
 }
