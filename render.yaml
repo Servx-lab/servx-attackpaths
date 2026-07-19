@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: servx-attackpaths-executor
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 300
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: SERVX_CONTROL_PLANE_URL
+        sync: false
+      - key: SERVX_EXECUTOR_INBOUND_HMAC_SECRET
+        sync: false
+      - key: SERVX_EXECUTOR_INBOUND_KEY_ID
+        value: servx-control-plane-2026-01
+      - key: SERVX_EXECUTOR_OUTBOUND_HMAC_SECRET
+        sync: false
+      - key: SERVX_EXECUTOR_OUTBOUND_KEY_ID
+        value: attackpaths-executor-2026-01

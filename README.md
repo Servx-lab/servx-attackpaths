@@ -1,132 +1,105 @@
-# ServX Attack Paths
+# ServX Attack Paths executor
 
-**Dedicated Security Scanning, Vulnerability Analysis & OWASP Web Top 10 Assurance Engine for ServX.**
+This repository is the isolated **scan executor** for ServX Attack Paths. It is
+not a user-facing application and must be deployed separately from the ServX
+control plane.
 
----
+The browser stays inside the main ServX application:
 
-## 🏛️ Architecture Overview
-
-`servx-attackpaths` is a specialized microservice decoupled from the main **ServX** control plane monorepo. It handles CPU-bound and network-intensive security scanning tasks, repository materialization, external vulnerability database queries, and attack graph generation without impacting the primary ServX API or web frontend.
-
-```mermaid
-graph TD
-    User([User / Browser]) -->|1. Request Scan| ServXWeb[ServX Web Dashboard]
-    ServXWeb -->|2. POST /api/attack-paths/jobs| ServXAPI[ServX Main API]
-    ServXAPI -->|3. Proxy via REST| AttackPathsSvc[ServX Attack Paths Service :5001]
-    
-    subgraph Attack Paths Engine
-        AttackPathsSvc -->|4. Materialize Repo| GitHub[GitHub API / Git]
-        AttackPathsSvc -->|5. Query Deps| OSV[OSV.dev Vulnerability DB]
-        AttackPathsSvc -->|6. Execute CLI Tools| Scanners[nuclei, gitleaks, semgrep, trivy, syft, cloudsploit]
-        AttackPathsSvc -->|7. Build Graph| Graph[Attack Path Graph & OWASP Top 10 Summary]
-    end
-    
-    AttackPathsSvc -->|8. SSE Realtime Stream| ServXAPI
-    ServXAPI -->|9. SSE Stream| ServXWeb
+```text
+ServX web -> ServX API (auth, authorization, quota, job store, SSE)
+          -> signed HTTPS -> this executor (queued repository scan)
+          <- signed HTTPS -- progress and findings
 ```
 
----
+The executor has no MongoDB connection, Supabase key, encryption key, or
+persisted GitHub credential. ServX sends a signed job id, the executor fetches
+one in-memory scan input over a second signed channel, and results flow back to
+ServX. It exposes only:
 
-## 🛡️ Integrated Security Scanners
+- `GET /health` — unauthenticated process liveness.
+- `GET /ready` — HMAC-protected configuration/readiness check.
+- `POST /internal/v1/wake` — HMAC-protected cold-start warmup.
+- `POST /internal/v1/jobs/:jobId/dispatch` — HMAC-protected, idempotent job
+  queueing.
 
-The engine dynamically detects installed CLI tools and executes a comprehensive security suite:
+There is no browser CORS API and no public job-create/result endpoint.
 
-1. **Secret & Credential Scanning (`gitleaks` + Built-in Regex Engine)**
-   - Detects exposed AWS access keys, GitHub PATs, JWTs, basic auth tokens, and generic API keys.
-2. **Static Application Security Testing (`semgrep` + Built-in SAST)**
-   - Identifies injection vulnerabilities (SQLi, NoSQLi, Command Injection), unsafe DOM manipulation (`innerHTML`), and dynamic code evaluation (`eval`, `new Function`).
-3. **Infrastructure as Code & Container Security (`trivy` + Built-in IaC Scanner)**
-   - Checks Dockerfiles for root execution and missing healthchecks, Vercel configurations for missing CSP/CORS restrictions, and Terraform/Render configs for public bucket exposure.
-4. **Software Bill of Materials & Supply Chain (`syft` + OSV.dev + GitHub Advisories)**
-   - Generates SBOM inventory, queries OSV.dev for vulnerable npm dependencies, and aggregates open GitHub security advisories.
-5. **Cloud Security Posture Management (`cloudsploit` + Built-in CSPM)**
-   - Identifies cloud configuration files and environment variable leaks.
-6. **Dynamic Application Security Testing (`nuclei` + Live HTTP Probes)**
-   - Probes live target URLs for missing security headers (`HSTS`, `X-Content-Type-Options`, `X-Frame-Options`), wildcard CORS (`*`), and insecure session cookies.
+## Scan profiles
 
----
+Every job is created by the authenticated ServX API only after it confirms the
+user can access the connected GitHub repository. This executor never accepts a
+repository name, Git URL, target URL, or scanner arguments from a browser.
 
-## 🚀 API Endpoints
+`quick` provides GitHub Dependabot/code/secret-scanning alerts, OSV dependency
+checks, and bounded source/config evidence without cloning the full repository.
 
-The service exposes a lightweight HTTP REST and Server-Sent Events (SSE) API on **Port 5001**:
+`deep_repo` is the default interactive scan. The executor shallow-clones the
+already-authorized repository, rejects metadata larger than 100 MiB by default
+(configurable, hard maximum 250 MiB), removes Git metadata and symlinks, and
+runs one scanner at a time. The image contains pinned releases of Gitleaks,
+Semgrep, Trivy, and Syft, plus a reviewed Semgrep rules commit. Its persisted progress stages are: prepare the
+repository, scan secrets, analyze source, check dependencies/configuration,
+build the SBOM, and normalize the report. Workspaces and raw reports are
+deleted at the end of the job.
 
-### `POST /api/v1/jobs`
-Initiates a new vulnerability and attack path scan job.
-- **Request Body:**
-  ```json
-  {
-    "requestedBy": "user_123",
-    "repoId": "12345678",
-    "repoFullName": "Servx-lab/ServX",
-    "targetUrl": "https://servx.dev",
-    "scanTypes": ["supply_chain", "secrets", "injection"],
-    "analysisDepth": 2,
-    "githubAccessTokenEnc": "encrypted_token",
-    "githubTokenIv": "hex_iv"
-  }
-  ```
-- **Response:**
-  ```json
-  {
-    "jobId": "65f0a1b2c3d4e5f6a7b8c9d0",
-    "status": "queued",
-    "message": "Scan job initialized successfully."
-  }
-  ```
+`verified_live` remains rejected. The product does not scan arbitrary URLs or
+perform DAST in this service.
 
-### `GET /api/v1/jobs/:id`
-Retrieves the complete scan results, tool statuses, attack graph artifact, and OWASP Web Top 10 (2025) assurance summary.
+The Free Render executor intentionally runs one scan at a time; all additional
+jobs wait in the ServX-controlled queue. Durable job state and the daily quota
+remain in ServX MongoDB, not in Render memory.
 
-### `GET /api/v1/jobs/:id/stream`
-Server-Sent Events (SSE) endpoint streaming real-time phase updates and log events:
-```http
-event: progress
-data: {"phase":"cpgraph_building","statusMessage":"Materializing repository files from GitHub..."}
+## Local setup
 
-event: completed
-data: {"phase":"completed","statusMessage":"Real security scan completed"}
-```
-
-### `DELETE /api/v1/jobs/:id`
-Aborts an active scan job and cleans up temporary sandbox directories.
-
----
-
-## 🛠️ Getting Started
-
-### 1. Prerequisites
-- **Node.js** v20+
-- **MongoDB** (Running locally or MongoDB Atlas)
-- **Optional CLI Scanners** (For full capability):
-  ```bash
-  # Install tools via homebrew or Linux package managers
-  brew install gitleaks semgrep trivy syft nuclei
-  ```
-
-### 2. Installation
 ```bash
-git clone https://github.com/Servx-lab/servx-attackpaths.git
-cd servx-attackpaths
-npm install
-```
-
-### 3. Environment Configuration
-Copy the example environment file and configure your encryption keys and MongoDB connection:
-```bash
+npm ci
 cp .env.example .env
+npm run build
+npm start
 ```
 
-### 4. Running the Development Server
-```bash
-npm run dev
+Set the variables described in [`.env.example`](.env.example). Use two distinct
+HMAC secrets: one for ServX -> executor, and one for executor -> ServX.
+
+## Render deployment
+
+[`render.yaml`](render.yaml) declares a Free Docker web service with the
+scanner toolchain baked into its image. Add its secret environment variables in
+the separate Render account, then set the matching values in the main ServX API
+environment:
+
+```text
+# ServX API
+ATTACK_PATHS_EXECUTOR_URL=https://<executor>.onrender.com
+ATTACK_PATHS_EXECUTOR_INBOUND_HMAC_SECRET=<same as executor inbound secret>
+ATTACK_PATHS_EXECUTOR_INBOUND_KEY_ID=servx-control-plane-2026-01
+ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET=<same as executor outbound secret>
+ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID=attackpaths-executor-2026-01
+ATTACK_PATHS_MAX_QUEUED_JOBS=25
+# Set to true only to pause new scan admissions and new executor dispatches.
+ATTACK_PATHS_KILL_SWITCH=false
 ```
-The server will start on `http://localhost:5001`.
 
----
+Do not put either HMAC secret in the frontend. Do not configure `MONGODB_URI`,
+`ENCRYPTION_KEY`, or a reusable `GITHUB_TOKEN` on the executor.
 
-## 📦 Why Separate from ServX?
+The ServX API must also have a working `REDIS_URL`: executor callbacks fail
+closed when replay protection is unavailable.
 
-In the initial ServX monorepo, attack path scanning was embedded directly within the core API server and background worker. This separation was performed to achieve:
-- **Resource Isolation:** Heavy static analysis tools and dependency queries no longer consume CPU and memory from the core ServX API.
-- **Clean Dependency Tree:** Removes specialized scanning CLI wrappers and git materialization dependencies from the general web application workspace.
-- **Independent Scaling:** The security scanning engine can be scaled independently on dedicated compute instances with specialized security tools pre-installed.
+ServX persists each job, grants the executor a short-lived lease, rejects stale
+callbacks, requeues expired leases after a restart, and supports user
+cancellation. The executor still handles one job at a time; a bounded queue is
+an intentional capacity control, not a background-process substitute.
+
+Free Render web services sleep after idle time and can restart at any time, so
+the control plane treats the executor as a wake-on-dispatch dependency rather
+than a durable worker. The dashboard's authenticated warmup request makes the
+cold start less visible; a signed dispatch then queues the job. Do not use a
+public cron keepalive: it burns free-runtime hours without improving scan
+correctness.
+
+For the detailed integration, security boundaries, rollout policy, and
+remaining hardening work, read [the integration plan](docs/servx-integration-plan.md).
+For scheduled and pull-request scanning alongside the interactive executor,
+read the [GitHub Actions deep-scan guide](docs/github-actions-deep-scan.md).
