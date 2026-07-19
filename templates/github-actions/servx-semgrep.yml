@@ -1,0 +1,38 @@
+# Copy to .servx/servx-semgrep.yml in the repository being scanned.
+# Keep these rules in source control. Changes should be reviewed just like code.
+rules:
+  - id: servx.javascript.eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Dynamic code execution can turn untrusted input into code execution.
+    metadata:
+      category: security
+      cwe: 'CWE-95'
+    pattern: eval(...)
+
+  - id: servx.javascript.function-constructor
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: The Function constructor can execute dynamically built code.
+    metadata:
+      category: security
+      cwe: 'CWE-95'
+    pattern: new Function(...)
+
+  - id: servx.javascript.innerhtml-assignment
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Assigning to innerHTML can create DOM XSS when the value is untrusted.
+    metadata:
+      category: security
+      cwe: 'CWE-79'
+    pattern: $ELEMENT.innerHTML = $VALUE
+
+  - id: servx.python.subprocess-shell
+    languages: [python]
+    severity: ERROR
+    message: Running a subprocess with shell=True can enable command injection.
+    metadata:
+      category: security
+      cwe: 'CWE-78'
+    pattern: subprocess.$FUNC(..., shell=True, ...)
