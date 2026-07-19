@@ -1,41 +1,50 @@
 import express from 'express';
-import cors from 'cors';
 import dotenv from 'dotenv';
-import mongoose from 'mongoose';
 import routes from './api/routes.js';
-import { runAttackPathsJobV1 } from './engine/attackPathsJobRunner.js';
+import { activeDispatchCount, isDispatcherReady, waitForDispatchDrain } from './engine/dispatchService.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5001;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/servx-attackpaths';
 
-app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buffer) => {
+    (req as express.Request & { rawBody?: string }).rawBody = buffer.toString('utf8');
+  },
+}));
 
-app.use('/api/v1', routes);
+app.use(routes);
 
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', service: 'servx-attackpaths', version: '0.1.0' });
+  res.status(200).json({
+    status: 'ok',
+    service: 'servx-attackpaths',
+    version: '0.1.0',
+    activeJobs: activeDispatchCount(),
+  });
 });
 
-async function startServer() {
-  app.listen(PORT, () => {
+function startServer() {
+  const server = app.listen(PORT, () => {
     console.log(`[servx-attackpaths] 🚀 Service running on port ${PORT}`);
     console.log(`[servx-attackpaths] Health check available at http://localhost:${PORT}/health`);
+    console.log(`[servx-attackpaths] Executor ready: ${isDispatcherReady() ? 'yes' : 'no'}`);
   });
 
-  console.log(`[servx-attackpaths] Connecting to MongoDB at ${MONGODB_URI}...`);
-  mongoose.connect(MONGODB_URI).then(() => {
-    console.log(`[servx-attackpaths] ✅ Connected to MongoDB.`);
-    // Start background scanning engine loop
-    runAttackPathsJobV1().catch((err) => {
-      console.error(`[servx-attackpaths] Fatal error in background job runner:`, err);
-    });
-  }).catch((err) => {
-    console.error(`[servx-attackpaths] ⚠️ Failed to connect to MongoDB:`, err.message || err);
-  });
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[servx-attackpaths] Received ${signal}; stopping new requests and draining active scans.`);
+    server.close();
+    await waitForDispatchDrain(270_000);
+    process.exit(0);
+  };
+
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
 }
 
 startServer();
