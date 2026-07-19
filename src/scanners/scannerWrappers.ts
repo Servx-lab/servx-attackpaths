@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import { spawn } from 'child_process';
 import type { ScanArtifact, ScannerRunResult } from './scannerRunner.js';
 
@@ -46,7 +47,8 @@ async function saveArtifact(jobDir: string, fileName: string, content: string): 
 }
 
 function makeFindingId(prefix: string, identifier: string): string {
-  return `${prefix}-${identifier}`.replace(/[^a-zA-Z0-9-_]/g, '_').substring(0, 100);
+  const digest = crypto.createHash('sha256').update(identifier).digest('hex').slice(0, 24);
+  return `${prefix}-${digest}`;
 }
 
 export async function parseGitleaksFindings(repoId: string, result: ScannerRunResult): Promise<AttackPathFinding[]> {
@@ -56,13 +58,13 @@ export async function parseGitleaksFindings(repoId: string, result: ScannerRunRe
     const parsed = JSON.parse(raw);
     const findings = Array.isArray(parsed) ? parsed : [];
     return findings.map((item: any) => ({
-      id: makeFindingId('gitleaks', item.RuleID || item.StartLine || item.commit || 'unknown'),
+      id: makeFindingId('gitleaks', [repoId, item.Fingerprint, item.RuleID, item.File || item.file || item.Path, item.StartLine, item.EndLine].filter(Boolean).join(':') || 'unknown'),
       severity: (item.Severity === 'high' || item.Severity === 'critical' ? 'critical' : item.Severity === 'medium' ? 'medium' : 'low') as 'critical' | 'medium' | 'low',
       title: `Secret detected: ${item.RuleID || 'unknown rule'}`,
       detail: item.Description || item.Message || 'Potential secret detected in repository',
       file: item.File || item.file || item.Path,
       source: 'secret_scan',
-      metadata: { ruleId: item.RuleID, startLine: item.StartLine, endLine: item.EndLine, fingerprint: item.Fingerprint },
+      metadata: { ruleId: item.RuleID, startLine: item.StartLine, endLine: item.EndLine, fingerprintHash: item.Fingerprint ? makeFindingId('fingerprint', String(item.Fingerprint)) : undefined },
     }));
   } catch {
     return [];
@@ -76,7 +78,7 @@ export async function parseSemgrepFindings(repoId: string, result: ScannerRunRes
     const parsed = JSON.parse(raw);
     const findings = Array.isArray(parsed?.results) ? parsed.results : [];
     return findings.map((item: any) => ({
-      id: makeFindingId('semgrep', item.check_id || item.ruleId || item.fingerprint || 'unknown'),
+      id: makeFindingId('semgrep', [repoId, item.fingerprint, item.check_id || item.ruleId, item.path, item.start?.line, item.end?.line].filter(Boolean).join(':') || 'unknown'),
       severity: (item.extra?.severity === 'CRITICAL' || item.extra?.severity === 'ERROR' ? 'critical' :
         item.extra?.severity === 'WARNING' ? 'medium' : 'low') as 'critical' | 'medium' | 'low',
       title: item.extra?.message || item.check_id || 'Semgrep finding',
@@ -124,6 +126,21 @@ export async function parseTrivyFindings(repoId: string, result: ScannerRunResul
             file: item.Target,
             source: 'iac_scan',
             metadata: { ruleId: misconf.RuleID, category: misconf.Category },
+          });
+        }
+      }
+      if (Array.isArray(item?.Secrets)) {
+        for (const secret of item.Secrets) {
+          findings.push({
+            id: makeFindingId('trivy-secret', [repoId, item.Target, secret.RuleID, secret.StartLine, secret.EndLine].filter(Boolean).join(':') || 'unknown'),
+            severity: (secret.Severity === 'CRITICAL' || secret.Severity === 'HIGH' ? 'critical' :
+              secret.Severity === 'MEDIUM' ? 'medium' : 'low') as 'critical' | 'medium' | 'low',
+            title: secret.Title || secret.RuleID || 'Potential secret detected',
+            detail: secret.Description || 'Trivy detected a potential secret. Review the source and rotate the credential if it is valid.',
+            file: item.Target,
+            source: 'secret_scan',
+            // Deliberately omit Match, Code, and any other matched source value.
+            metadata: { ruleId: secret.RuleID, startLine: secret.StartLine, endLine: secret.EndLine, category: secret.Category },
           });
         }
       }

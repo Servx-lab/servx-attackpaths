@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildStaticAttackPathCandidates, runRemoteAttackPathsJob } from '../src/engine/attackPathsJobRunner.js';
+import { buildStaticAttackPathCandidates } from '../src/engine/attackPathsJobRunner.js';
+import { runRemoteAttackPathsJob } from '../src/engine/remoteJobRunner.js';
 
 test('rejects a live target before any repository or network scanner work begins', async () => {
   let completionCalled = false;
@@ -20,7 +21,7 @@ test('rejects a live target before any repository or network scanner work begins
   }, {
     progress: async () => undefined,
     complete: async () => { completionCalled = true; },
-    fail: async (update) => { failure = update.lastError; },
+    fail: async (message) => { failure = message; },
   });
 
   assert.equal(completionCalled, false);

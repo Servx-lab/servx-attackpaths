@@ -79,3 +79,41 @@ Run one repository scan at a time and keep ServX's three-scans-per-24-hours
 and bounded queue policy enabled. Move active scanning or materially higher
 capacity to a dedicated worker after measuring real CPU, memory, duration, and
 egress usage.
+
+## Production deployment: Vercel + Render
+
+Keep the services separate. The Vercel browser app must only call the ServX API;
+it must never receive the executor URL or either HMAC secret.
+
+```text
+Vercel (ServX web) -- HTTPS + user JWT --> Render (ServX API)
+Render (ServX API) -- signed HTTPS -----> Render (Attack Paths executor)
+Render (Attack Paths executor) -- signed HTTPS --> Render (ServX API)
+```
+
+Create the executor from this repository's `render.yaml`, then set these values
+in the executor Render service:
+
+```text
+SERVX_CONTROL_PLANE_URL=https://<servx-api>.onrender.com
+ATTACK_PATHS_EXECUTOR_INBOUND_KEY_ID=servx-control-plane-2026-01
+ATTACK_PATHS_EXECUTOR_INBOUND_HMAC_SECRET=<secret-a>
+ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID=attackpaths-executor-2026-01
+ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET=<secret-b>
+```
+
+Set the corresponding values in the existing ServX API Render service:
+
+```text
+ATTACK_PATHS_EXECUTOR_URL=https://<attack-paths-executor>.onrender.com
+ATTACK_PATHS_EXECUTOR_INBOUND_KEY_ID=servx-control-plane-2026-01
+ATTACK_PATHS_EXECUTOR_INBOUND_HMAC_SECRET=<secret-a>
+ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID=attackpaths-executor-2026-01
+ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET=<secret-b>
+FRONTEND_URL=https://<your-servx-project>.vercel.app
+```
+
+In Vercel, set `VITE_API_BASE_URL=https://<servx-api>.onrender.com` for the
+ServX web project and redeploy. Add any custom Vercel domain to `FRONTEND_URL`
+as a comma-separated value. Do not set executor secrets or the executor URL in
+Vercel.
