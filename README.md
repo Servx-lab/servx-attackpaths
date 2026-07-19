@@ -1,105 +1,81 @@
 # ServX Attack Paths executor
 
-This repository is the isolated **scan executor** for ServX Attack Paths. It is
-not a user-facing application and must be deployed separately from the ServX
-control plane.
-
-The browser stays inside the main ServX application:
+This repository is the isolated repository-scan executor for ServX. It is not
+a browser API and it does not own users, repositories, job state, MongoDB, or
+long-lived GitHub credentials.
 
 ```text
-ServX web -> ServX API (auth, authorization, quota, job store, SSE)
-          -> signed HTTPS -> this executor (queued repository scan)
-          <- signed HTTPS -- progress and findings
+ServX web -> ServX API (auth, repository authorization, quotas, job state, SSE)
+          -> signed HTTPS -> Attack Paths executor
+          <- signed HTTPS -- progress, findings, and completion
 ```
 
-The executor has no MongoDB connection, Supabase key, encryption key, or
-persisted GitHub credential. ServX sends a signed job id, the executor fetches
-one in-memory scan input over a second signed channel, and results flow back to
-ServX. It exposes only:
+Only the ServX API can call the executor. Every non-health endpoint requires
+an HMAC signature containing the request method, path, timestamp, nonce, and
+body hash. The executor fetches a short-lived, lease-bound job input from
+ServX, scans one job at a time, returns normalized evidence, and deletes its
+temporary workspace.
 
-- `GET /health` — unauthenticated process liveness.
-- `GET /ready` — HMAC-protected configuration/readiness check.
-- `POST /internal/v1/wake` — HMAC-protected cold-start warmup.
-- `POST /internal/v1/jobs/:jobId/dispatch` — HMAC-protected, idempotent job
-  queueing.
+## Endpoints
 
-There is no browser CORS API and no public job-create/result endpoint.
+- `GET /health` — public liveness only.
+- `GET /ready` — signed readiness/configuration check.
+- `POST /internal/v1/wake` — signed warm-up request.
+- `POST /internal/v1/jobs/:jobId/dispatch` — signed, idempotent queueing.
+- `POST /internal/v1/jobs/:jobId/cancel` — signed cancellation request.
 
-## Scan profiles
+There is deliberately no public create-job, result, SSE, CORS, MongoDB, or
+direct GitHub-token endpoint in this process.
 
-Every job is created by the authenticated ServX API only after it confirms the
-user can access the connected GitHub repository. This executor never accepts a
-repository name, Git URL, target URL, or scanner arguments from a browser.
+## Scan policy
 
-`quick` provides GitHub Dependabot/code/secret-scanning alerts, OSV dependency
-checks, and bounded source/config evidence without cloning the full repository.
+The interactive default is `deep_repo` for a connected repository that ServX
+has authorized for the signed-in user. The executor gathers GitHub security
+alerts, OSV dependency evidence, built-in source/config checks, and available
+Gitleaks, Semgrep, Trivy, and Syft results. It returns scanner coverage so a
+clean result is not confused with proof of security.
 
-`deep_repo` is the default interactive scan. The executor shallow-clones the
-already-authorized repository, rejects metadata larger than 100 MiB by default
-(configurable, hard maximum 250 MiB), removes Git metadata and symlinks, and
-runs one scanner at a time. The image contains pinned releases of Gitleaks,
-Semgrep, Trivy, and Syft, plus a reviewed Semgrep rules commit. Its persisted progress stages are: prepare the
-repository, scan secrets, analyze source, check dependencies/configuration,
-build the SBOM, and normalize the report. Workspaces and raw reports are
-deleted at the end of the job.
+Active URL/DAST scanning is rejected. It must stay disabled until ServX has
+verified deployment ownership and isolated outbound network access.
 
-`verified_live` remains rejected. The product does not scan arbitrary URLs or
-perform DAST in this service.
-
-The Free Render executor intentionally runs one scan at a time; all additional
-jobs wait in the ServX-controlled queue. Durable job state and the daily quota
-remain in ServX MongoDB, not in Render memory.
-
-## Local setup
+## Local development
 
 ```bash
-npm ci
+npm install
 cp .env.example .env
-npm run build
-npm start
+npm run dev
 ```
 
-Set the variables described in [`.env.example`](.env.example). Use two distinct
-HMAC secrets: one for ServX -> executor, and one for executor -> ServX.
-
-## Render deployment
-
-[`render.yaml`](render.yaml) declares a Free Docker web service with the
-scanner toolchain baked into its image. Add its secret environment variables in
-the separate Render account, then set the matching values in the main ServX API
-environment:
+Configure both directions of the HMAC bridge. The executor uses
+`SERVX_CONTROL_PLANE_URL` to call the ServX internal router; the ServX API uses
+`ATTACK_PATHS_EXECUTOR_URL` to call this service. The two secret values must be
+distinct and mirrored in the appropriate direction:
 
 ```text
-# ServX API
-ATTACK_PATHS_EXECUTOR_URL=https://<executor>.onrender.com
-ATTACK_PATHS_EXECUTOR_INBOUND_HMAC_SECRET=<same as executor inbound secret>
-ATTACK_PATHS_EXECUTOR_INBOUND_KEY_ID=servx-control-plane-2026-01
-ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET=<same as executor outbound secret>
-ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID=attackpaths-executor-2026-01
-ATTACK_PATHS_MAX_QUEUED_JOBS=25
-# Set to true only to pause new scan admissions and new executor dispatches.
-ATTACK_PATHS_KILL_SWITCH=false
+# ServX API -> executor (set in both places)
+ATTACK_PATHS_EXECUTOR_INBOUND_KEY_ID=servx-control-plane-local
+ATTACK_PATHS_EXECUTOR_INBOUND_HMAC_SECRET=<long random secret A>
+
+# executor -> ServX API (set in both places)
+ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID=attackpaths-executor-local
+ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET=<different long random secret B>
 ```
 
-Do not put either HMAC secret in the frontend. Do not configure `MONGODB_URI`,
-`ENCRYPTION_KEY`, or a reusable `GITHUB_TOKEN` on the executor.
+For the local executor, set `SERVX_CONTROL_PLANE_URL=http://localhost:5000`.
+For the local ServX API, set `ATTACK_PATHS_EXECUTOR_URL=http://localhost:5001`.
 
-The ServX API must also have a working `REDIS_URL`: executor callbacks fail
-closed when replay protection is unavailable.
+Do **not** set `MONGODB_URI`, `ENCRYPTION_KEY`, or `GITHUB_TOKEN` in the
+executor environment. ServX retains those responsibilities.
 
-ServX persists each job, grants the executor a short-lived lease, rejects stale
-callbacks, requeues expired leases after a restart, and supports user
-cancellation. The executor still handles one job at a time; a bounded queue is
-an intentional capacity control, not a background-process substitute.
+## Free Render beta
 
-Free Render web services sleep after idle time and can restart at any time, so
-the control plane treats the executor as a wake-on-dispatch dependency rather
-than a durable worker. The dashboard's authenticated warmup request makes the
-cold start less visible; a signed dispatch then queues the job. Do not use a
-public cron keepalive: it burns free-runtime hours without improving scan
-correctness.
+The separate Render account is suitable for isolation, not for an always-on
+worker. Let the web service sleep when unused; ServX's authenticated warm-up
+and signed dispatch wake it as needed. The control plane persists the queue and
+lease, so a cold start or executor restart does not lose a job. Do not use a
+public cron keepalive to manufacture uptime.
 
-For the detailed integration, security boundaries, rollout policy, and
-remaining hardening work, read [the integration plan](docs/servx-integration-plan.md).
-For scheduled and pull-request scanning alongside the interactive executor,
-read the [GitHub Actions deep-scan guide](docs/github-actions-deep-scan.md).
+Run one repository scan at a time and keep ServX's three-scans-per-24-hours
+and bounded queue policy enabled. Move active scanning or materially higher
+capacity to a dedicated worker after measuring real CPU, memory, duration, and
+egress usage.
