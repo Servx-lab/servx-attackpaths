@@ -1,10 +1,11 @@
-import { makeOutboundServiceHeaders } from '../security/serviceAuth.js';
+import crypto from 'node:crypto';
+import { sha256, signServiceRequest } from '../security/serviceAuth.js';
 
 export type RemoteScanInput = {
   jobId: string;
   repoId: string;
   repoFullName: string;
-  targetUrl?: string;
+  targetUrl: string;
   scanTypes: string[];
   analysisDepth: number;
   profile: 'quick' | 'deep_repo' | 'verified_live';
@@ -13,66 +14,75 @@ export type RemoteScanInput = {
   githubAccessToken: string;
 };
 
-type ProgressUpdate = {
-  status: string;
-  progressPct: number;
-  phaseMessage: string;
-};
-
-function controlPlaneBaseUrl(): string {
-  const value = process.env.SERVX_CONTROL_PLANE_URL?.trim().replace(/\/+$/, '');
-  if (!value) throw new Error('SERVX_CONTROL_PLANE_URL is required');
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
   return value;
 }
 
-async function signedFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const body = typeof init.body === 'string' ? init.body : '';
-  const headers = new Headers(init.headers);
-  const signed = makeOutboundServiceHeaders({ method: init.method || 'GET', path, body });
-  Object.entries(signed).forEach(([key, value]) => headers.set(key, value));
-  if (body) headers.set('Content-Type', 'application/json');
-
-  return fetch(`${controlPlaneBaseUrl()}${path}`, {
-    ...init,
-    headers,
-    signal: AbortSignal.timeout(30_000),
-  });
+function baseUrl(): string {
+  return requiredEnv('SERVX_CONTROL_PLANE_URL').replace(/\/+$/, '');
 }
 
-async function requireOk(response: Response, action: string): Promise<void> {
-  if (response.ok) return;
-  const detail = await response.text().catch(() => '');
-  throw new Error(`${action} failed (${response.status})${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+function headers(method: string, path: string, body = ''): Record<string, string> {
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomUUID();
+  const contentSha256 = sha256(body);
+  const signature = signServiceRequest({
+    secret: requiredEnv('ATTACK_PATHS_EXECUTOR_OUTBOUND_HMAC_SECRET'),
+    method,
+    path,
+    timestamp,
+    nonce,
+    contentSha256,
+  });
+  return {
+    Authorization: 'ServX-HMAC v1',
+    'X-ServX-Key-Id': requiredEnv('ATTACK_PATHS_EXECUTOR_OUTBOUND_KEY_ID'),
+    'X-ServX-Timestamp': timestamp,
+    'X-ServX-Nonce': nonce,
+    'X-ServX-Content-SHA256': contentSha256,
+    'X-ServX-Signature': `v1=${signature}`,
+    ...(body ? { 'Content-Type': 'application/json' } : {}),
+  };
+}
+
+async function request(path: string, method: 'GET' | 'POST', body = ''): Promise<Response> {
+  const response = await fetch(`${baseUrl()}${path}`, {
+    method,
+    headers: headers(method, path, body),
+    body: body || undefined,
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`ServX control-plane request ${path} failed (${response.status})${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+  }
+  return response;
 }
 
 export async function fetchRemoteScanInput(jobId: string): Promise<RemoteScanInput> {
   const path = `/api/internal/attack-paths/jobs/${encodeURIComponent(jobId)}/input`;
-  const response = await signedFetch(path);
-  await requireOk(response, 'Fetch scan input');
+  const response = await request(path, 'GET');
   const payload = await response.json() as { input?: RemoteScanInput };
-  if (!payload.input?.jobId || !payload.input.githubAccessToken || !payload.input.executionLeaseId) {
-    throw new Error('ServX returned incomplete scan input');
-  }
+  if (!payload.input?.executionLeaseId || !payload.input.githubAccessToken) throw new Error('ServX returned incomplete scan input');
   return payload.input;
 }
 
-export async function reportRemoteProgress(jobId: string, executionLeaseId: string, update: ProgressUpdate): Promise<void> {
+export async function reportRemoteProgress(jobId: string, executionLeaseId: string, update: { status: string; progressPct: number; phaseMessage: string }): Promise<void> {
   const path = `/api/internal/attack-paths/jobs/${encodeURIComponent(jobId)}/progress`;
-  const body = JSON.stringify({ ...update, executionLeaseId });
-  const response = await signedFetch(path, { method: 'POST', body });
-  await requireOk(response, 'Report scan progress');
+  const body = JSON.stringify({ executionLeaseId, ...update });
+  await request(path, 'POST', body);
 }
 
-export async function reportRemoteCompletion(jobId: string, executionLeaseId: string, update: Record<string, unknown>): Promise<void> {
+export async function completeRemoteJob(jobId: string, executionLeaseId: string, payload: Record<string, unknown>): Promise<void> {
   const path = `/api/internal/attack-paths/jobs/${encodeURIComponent(jobId)}/complete`;
-  const body = JSON.stringify({ ...update, executionLeaseId });
-  const response = await signedFetch(path, { method: 'POST', body });
-  await requireOk(response, 'Report scan completion');
+  const body = JSON.stringify({ executionLeaseId, status: 'completed', progressPct: 100, ...payload });
+  await request(path, 'POST', body);
 }
 
-export async function reportRemoteFailure(jobId: string, executionLeaseId: string, update: { lastError: string; progressPct?: number }): Promise<void> {
+export async function failRemoteJob(jobId: string, executionLeaseId: string, lastError: string, progressPct = 0): Promise<void> {
   const path = `/api/internal/attack-paths/jobs/${encodeURIComponent(jobId)}/fail`;
-  const body = JSON.stringify({ ...update, executionLeaseId });
-  const response = await signedFetch(path, { method: 'POST', body });
-  await requireOk(response, 'Report scan failure');
+  const body = JSON.stringify({ executionLeaseId, lastError: lastError.slice(0, 4_000), progressPct });
+  await request(path, 'POST', body);
 }
