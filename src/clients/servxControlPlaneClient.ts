@@ -52,7 +52,7 @@ async function request(path: string, method: 'GET' | 'POST', body = ''): Promise
     method,
     headers: headers(method, path, body),
     body: body || undefined,
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(120_000),
   });
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
@@ -61,12 +61,24 @@ async function request(path: string, method: 'GET' | 'POST', body = ''): Promise
   return response;
 }
 
-export async function fetchRemoteScanInput(jobId: string): Promise<RemoteScanInput> {
+export async function fetchRemoteScanInput(jobId: string, retries = 2): Promise<RemoteScanInput> {
   const path = `/api/internal/attack-paths/jobs/${encodeURIComponent(jobId)}/input`;
-  const response = await request(path, 'GET');
-  const payload = await response.json() as { input?: RemoteScanInput };
-  if (!payload.input?.executionLeaseId || !payload.input.githubAccessToken) throw new Error('ServX returned incomplete scan input');
-  return payload.input;
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      const response = await request(path, 'GET');
+      const payload = await response.json() as { input?: RemoteScanInput };
+      if (!payload.input?.executionLeaseId || !payload.input.githubAccessToken) throw new Error('ServX returned incomplete scan input');
+      return payload.input;
+    } catch (err: any) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt <= retries) {
+        console.warn(`[servxControlPlaneClient] fetchRemoteScanInput attempt ${attempt} failed for ${jobId}: ${lastError.message}. Retrying...`);
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+      }
+    }
+  }
+  throw lastError || new Error('Failed to fetch scan input');
 }
 
 export async function reportRemoteProgress(jobId: string, executionLeaseId: string, update: { status: string; progressPct: number; phaseMessage: string }): Promise<void> {
