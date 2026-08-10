@@ -1,5 +1,10 @@
 # ServX Attack Paths executor
 
+> [!IMPORTANT]
+> **Two-Tier Documentation Strategy:** 
+> - **Tier 1 (Macro):** For overarching system architecture, environment registries, and deep-dive Master Guides, visit the [servx-docs](../servx-docs) repository.
+> - **Tier 2 (Micro):** For granular feature explanations, local API specs, and component-level information, browse the local `docs/` directory.
+
 This repository is the isolated repository-scan executor for ServX. It is not
 a browser API and it does not own users, repositories, job state, MongoDB, or
 long-lived GitHub credentials.
